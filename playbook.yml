@@ -1,0 +1,410 @@
+- name: 1 - Create passwords on the Ansible controller (app01)
+  hosts: app
+  gather_facts: false
+  tasks:
+  - name: Create private secrets directory
+    ansible.builtin.file:
+      path: /home/ubuntu/vprofile/.secrets
+      state: directory
+      mode: '0700'
+  - name: Generate passwords once and reuse them on subsequent runs
+    ansible.builtin.set_fact:
+      db_password: '{{ lookup(''ansible.builtin.password'', ''/home/ubuntu/vprofile/.secrets/db-password length=40
+        chars=ascii_letters,digits'') }}'
+      rabbitmq_password: '{{ lookup(''ansible.builtin.password'', ''/home/ubuntu/vprofile/.secrets/rabbitmq-password
+        length=40 chars=ascii_letters,digits'') }}'
+    no_log: true
+  - name: Protect password files
+    ansible.builtin.file:
+      path: '{{ item }}'
+      mode: '0600'
+    loop:
+    - /home/ubuntu/vprofile/.secrets/db-password
+    - /home/ubuntu/vprofile/.secrets/rabbitmq-password
+- name: 2 - Prepare all four servers
+  hosts: all
+  become: true
+  gather_facts: false
+  pre_tasks:
+  - name: Wait for SSH
+    ansible.builtin.wait_for_connection:
+      timeout: 600
+  - name: Wait for cloud-init
+    ansible.builtin.command: cloud-init status --wait
+    changed_when: false
+  - name: Gather facts
+    ansible.builtin.setup: {}
+  - name: Use these simple application settings
+    ansible.builtin.set_fact:
+      source_repo: https://github.com/abdelrahmanonline4/sourcecodeseniorwr.git
+      source_revision: 3c0d5ef7f5340ab9808daa27ec0c239b3a64b2d0
+      source_dir: /opt/vprofile/source
+      db_name: accounts
+      db_user: vprofile
+      rabbitmq_user: vprofile
+      db_host: 10.0.2.40
+      cache_host: 10.0.2.20
+      queue_host: 10.0.2.30
+      app_host: 10.0.1.10
+  - name: Read the controller passwords for the managed services
+    ansible.builtin.set_fact:
+      db_password: '{{ hostvars[''app01''][''db_password''] }}'
+      rabbitmq_password: '{{ hostvars[''app01''][''rabbitmq_password''] }}'
+    no_log: true
+  tasks:
+  - name: Install baseline packages
+    ansible.builtin.apt:
+      name:
+      - ca-certificates
+      - git
+      - python3
+      - python3-pymysql
+      update_cache: true
+      cache_valid_time: 3600
+      state: present
+      lock_timeout: 300
+  - name: Set machine hostname
+    ansible.builtin.hostname:
+      name: '{{ inventory_hostname }}'
+  - name: Resolve private service names without paid DNS
+    ansible.builtin.blockinfile:
+      path: /etc/hosts
+      marker: '# {mark} VPROFILE HOSTS'
+      block: |
+        {{ app_host }} app01 app01.vprofile
+        {{ db_host }} db01 db01.vprofile
+        {{ cache_host }} mc01 mc01.vprofile
+        {{ queue_host }} rmq01 rmq01.vprofile
+  - name: Allocate swap for small lab instances
+    ansible.builtin.command:
+      cmd: dd if=/dev/zero of=/swapfile bs=1M count=2048
+      creates: /swapfile
+    register: swap_created
+  - name: Protect swap file
+    ansible.builtin.file:
+      path: /swapfile
+      owner: root
+      group: root
+      mode: '0600'
+  - name: Format newly allocated swap
+    ansible.builtin.command: mkswap /swapfile
+    when: swap_created.changed
+  - name: Read active swap
+    ansible.builtin.command: swapon --show=NAME --noheadings
+    register: active_swap
+    changed_when: false
+  - name: Enable swap
+    ansible.builtin.command: swapon /swapfile
+    when: '''/swapfile'' not in active_swap.stdout_lines'
+  - name: Persist swap across reboots
+    ansible.builtin.lineinfile:
+      path: /etc/fstab
+      line: /swapfile none swap sw 0 0
+  - name: Protect application work directory
+    ansible.builtin.file:
+      path: /opt/vprofile
+      state: directory
+      owner: root
+      group: root
+      mode: '0700'
+- name: 3 - Configure database
+  hosts: database
+  become: true
+  tasks:
+  - name: Install MariaDB
+    ansible.builtin.apt:
+      name: mariadb-server
+      state: present
+      lock_timeout: 300
+  - name: Listen on private interface with modest memory limits
+    ansible.builtin.copy:
+      dest: /etc/mysql/mariadb.conf.d/60-vprofile.cnf
+      mode: '0644'
+      content: |
+        [mysqld]
+        bind-address = {{ private_ip }}
+        innodb_buffer_pool_size = 128M
+        max_connections = 40
+    notify: Restart MariaDB
+  - name: Enable MariaDB
+    ansible.builtin.service:
+      name: mariadb
+      state: started
+      enabled: true
+  - name: Remove anonymous accounts; retain Ubuntu root socket authentication
+    community.mysql.mysql_user:
+      name: ''
+      host_all: true
+      state: absent
+      login_unix_socket: /run/mysqld/mysqld.sock
+  - name: Remove test database
+    community.mysql.mysql_db:
+      name: test
+      state: absent
+      login_unix_socket: /run/mysqld/mysqld.sock
+  - name: Create application database
+    community.mysql.mysql_db:
+      name: '{{ db_name }}'
+      state: present
+      encoding: utf8
+      login_unix_socket: /run/mysqld/mysqld.sock
+  - name: Grant only the app host access to the application schema
+    community.mysql.mysql_user:
+      name: '{{ db_user }}'
+      host: '{{ app_host }}'
+      password: '{{ db_password }}'
+      priv: '{{ db_name }}.*:ALL'
+      state: present
+      login_unix_socket: /run/mysqld/mysqld.sock
+    no_log: true
+  - name: Fetch the same pinned revision used for the app
+    ansible.builtin.git:
+      repo: '{{ source_repo }}'
+      dest: '{{ source_dir }}'
+      version: '{{ source_revision }}'
+  - name: Inspect schema before importing a destructive upstream dump
+    community.mysql.mysql_query:
+      login_unix_socket: /run/mysqld/mysqld.sock
+      query: SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = 'accounts'
+    register: schema_state
+  - name: Import initial data only into an empty schema
+    community.mysql.mysql_db:
+      name: '{{ db_name }}'
+      state: import
+      target: '{{ source_dir }}/src/main/resources/db_backup.sql'
+      login_unix_socket: /run/mysqld/mysqld.sock
+    when: schema_state.query_result[0][0].n | int == 0
+  - name: Confirm all required tables exist (never overwrite an incomplete schema)
+    community.mysql.mysql_query:
+      login_unix_socket: /run/mysqld/mysqld.sock
+      query: SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = 'accounts' AND table_name
+        IN ('user','role','user_role')
+    register: required_tables
+  - name: Fail if manual schema recovery is needed
+    ansible.builtin.assert:
+      that: required_tables.query_result[0][0].n | int == 3
+      fail_msg: Incomplete accounts schema. Back up and inspect it; automatic re-import is disabled to protect
+        data.
+  - name: Apply database configuration now
+    ansible.builtin.meta: flush_handlers
+  handlers:
+  - name: Restart MariaDB
+    ansible.builtin.service:
+      name: mariadb
+      state: restarted
+- name: 4 - Configure cache
+  hosts: cache
+  become: true
+  tasks:
+  - name: Install Memcached
+    ansible.builtin.apt:
+      name: memcached
+      state: present
+      lock_timeout: 300
+  - name: Configure a single Memcached service, private TCP only
+    ansible.builtin.copy:
+      dest: /etc/memcached.conf
+      mode: '0644'
+      content: |
+        -d
+        logfile /var/log/memcached.log
+        -m 64
+        -p 11211
+        -u memcache
+        -l {{ private_ip }}
+        -U 0
+        -c 256
+    notify: Restart Memcached
+  - name: Enable Memcached
+    ansible.builtin.service:
+      name: memcached
+      state: started
+      enabled: true
+  - name: Apply Memcached configuration now
+    ansible.builtin.meta: flush_handlers
+  handlers:
+  - name: Restart Memcached
+    ansible.builtin.service:
+      name: memcached
+      state: restarted
+- name: 5 - Configure queue
+  hosts: queue
+  become: true
+  tasks:
+  - name: Install RabbitMQ from Ubuntu repository
+    ansible.builtin.apt:
+      name: rabbitmq-server
+      state: present
+      lock_timeout: 300
+  - name: Configure private listener and lab memory limit
+    ansible.builtin.copy:
+      dest: /etc/rabbitmq/rabbitmq.conf
+      owner: root
+      group: rabbitmq
+      mode: '0640'
+      content: |
+        listeners.tcp.default = {{ private_ip }}:5672
+        vm_memory_high_watermark.absolute = 256MiB
+        disk_free_limit.absolute = 512MB
+    notify: Restart RabbitMQ
+  - name: Enable RabbitMQ
+    ansible.builtin.service:
+      name: rabbitmq-server
+      state: started
+      enabled: true
+  - name: Apply RabbitMQ settings
+    ansible.builtin.meta: flush_handlers
+  - name: Create application user with permissions on default vhost
+    community.rabbitmq.rabbitmq_user:
+      user: '{{ rabbitmq_user }}'
+      password: '{{ rabbitmq_password }}'
+      update_password: always
+      vhost: /
+      configure_priv: .*
+      read_priv: .*
+      write_priv: .*
+      tags: ''
+      state: present
+    no_log: true
+  - name: Remove default guest account
+    community.rabbitmq.rabbitmq_user:
+      user: guest
+      state: absent
+  handlers:
+  - name: Restart RabbitMQ
+    ansible.builtin.service:
+      name: rabbitmq-server
+      state: restarted
+- name: 6 - Configure app
+  hosts: app
+  become: true
+  tasks:
+  - name: Install Java 11, Maven and distribution-maintained Tomcat 9
+    ansible.builtin.apt:
+      name:
+      - openjdk-11-jdk
+      - maven
+      - tomcat9
+      state: present
+      lock_timeout: 300
+  - name: Fetch pinned source (generated properties are replaced below)
+    ansible.builtin.git:
+      repo: '{{ source_repo }}'
+      dest: '{{ source_dir }}'
+      version: '{{ source_revision }}'
+      force: true
+    no_log: true
+  - name: Write application connection settings
+    no_log: true
+    ansible.builtin.copy:
+      dest: '{{ source_dir }}/src/main/resources/application.properties'
+      owner: root
+      group: root
+      mode: '0600'
+      content: |
+        jdbc.driverClassName=com.mysql.jdbc.Driver
+        jdbc.url=jdbc:mysql://{{ db_host }}:3306/{{ db_name }}?useUnicode=true&characterEncoding=UTF-8&zeroDateTimeBehavior=convertToNull&useSSL=false
+        jdbc.username={{ db_user }}
+        jdbc.password={{ db_password }}
+        memcached.active.host={{ cache_host }}
+        memcached.active.port=11211
+        memcached.standBy.host={{ cache_host }}
+        memcached.standBy.port=11211
+        rabbitmq.address={{ queue_host }}
+        rabbitmq.port=5672
+        rabbitmq.username={{ rabbitmq_user }}
+        rabbitmq.password={{ rabbitmq_password }}
+        # Elasticsearch is not part of the requested four-server architecture.
+        elasticsearch.host=127.0.0.1
+        elasticsearch.port=9300
+        elasticsearch.cluster=vprofile
+        elasticsearch.node=vprofilenode
+  - name: Verify backend TCP reachability from app machine
+    ansible.builtin.wait_for:
+      host: '{{ item.host }}'
+      port: '{{ item.port }}'
+      timeout: 120
+    loop:
+    - host: '{{ db_host }}'
+      port: 3306
+    - host: '{{ cache_host }}'
+      port: 11211
+    - host: '{{ queue_host }}'
+      port: 5672
+  - name: Build WAR and run upstream tests
+    ansible.builtin.command: mvn --batch-mode --no-transfer-progress clean verify
+    args:
+      chdir: '{{ source_dir }}'
+    environment:
+      JAVA_HOME: /usr/lib/jvm/java-11-openjdk-amd64
+      MAVEN_OPTS: -Xmx384m
+    changed_when: true
+    no_log: true
+  - name: Ensure systemd override directory exists
+    ansible.builtin.file:
+      path: /etc/systemd/system/tomcat9.service.d
+      state: directory
+      mode: '0755'
+  - name: Configure Tomcat Java and lab heap
+    ansible.builtin.copy:
+      dest: /etc/systemd/system/tomcat9.service.d/vprofile.conf
+      mode: '0644'
+      content: |
+        [Service]
+        Environment="JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64"
+        Environment="JAVA_OPTS=-Djava.awt.headless=true -Xms128m -Xmx384m -XX:+UseSerialGC"
+        UMask=0027
+    notify: Restart Tomcat
+  - name: Check deployed artifact
+    ansible.builtin.stat:
+      path: /var/lib/tomcat9/webapps/ROOT.war
+      checksum_algorithm: sha256
+    register: deployed_war
+  - name: Check built artifact
+    ansible.builtin.stat:
+      path: '{{ source_dir }}/target/vprofile-v2.war'
+      checksum_algorithm: sha256
+    register: built_war
+  - name: Deploy changed WAR
+    when: deployed_war.stat.checksum | default('') != built_war.stat.checksum
+    block:
+    - name: Stop Tomcat before replacing ROOT application
+      ansible.builtin.service:
+        name: tomcat9
+        state: stopped
+    - name: Remove only the old exploded ROOT application
+      ansible.builtin.file:
+        path: /var/lib/tomcat9/webapps/ROOT
+        state: absent
+    - name: Install WAR
+      ansible.builtin.copy:
+        src: '{{ source_dir }}/target/vprofile-v2.war'
+        dest: /var/lib/tomcat9/webapps/ROOT.war
+        remote_src: true
+        owner: tomcat
+        group: tomcat
+        mode: '0640'
+      no_log: true
+      notify: Restart Tomcat
+  - name: Apply Tomcat configuration
+    ansible.builtin.meta: flush_handlers
+  - name: Enable Tomcat
+    ansible.builtin.systemd:
+      name: tomcat9
+      daemon_reload: true
+      enabled: true
+      state: started
+  - name: Wait for application login page
+    ansible.builtin.uri:
+      url: http://127.0.0.1:8080/login
+      status_code: 200
+    register: login_check
+    until: login_check.status | default(0) == 200
+    retries: 30
+    delay: 10
+  handlers:
+  - name: Restart Tomcat
+    ansible.builtin.systemd:
+      name: tomcat9
+      daemon_reload: true
+      state: restarted

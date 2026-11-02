@@ -85,3 +85,6 @@ terraform destroy
 ```
 
 Destruction removes all servers, databases, and volumes; take a backup first if you need to retain data. Simply stopping the EC2 instances does not halt NAT and ALB billing or EBS storage charges. Your new account utilizes credits, but resources are not indefinitely free: NAT Gateways and ALBs alone cost approximately $49.28 per 730 hours at listed rates, prior to EC2, IPv4 public addresses, storage, and data transfer fees. Refer to [VPC Pricing](https://aws.amazon.com/vpc/pricing/) and [ALB Pricing](https://aws.amazon.com/elasticloadbalancing/pricing/).
+
+<img width="1097" height="511" alt="image" src="https://github.com/user-attachments/assets/085a0e97-a3c4-470e-a76e-1c3abc4096b2" />
+
